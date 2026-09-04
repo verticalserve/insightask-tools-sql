@@ -1,0 +1,70 @@
+# InsightAsk SQL — client install.
+#
+#   cp .env.example .env   &&   edit .env   &&   chmod 600 .env
+#   docker compose up -d
+#   open http://<host>:8080
+#
+# That is the whole install. The `init` service indexes Unity Catalog on first
+# start and loads the curated semantics; on every later start it finds an
+# existing snapshot and returns immediately, so `up` stays fast.
+#
+# Upgrade:  edit ASKSQL_VERSION in .env, then `docker compose pull && docker compose up -d`
+# Rollback: set ASKSQL_VERSION back and repeat. The catalog volume is untouched.
+
+# Pinned so the volume name does not change if the directory is renamed —
+# renaming it otherwise orphans the index and the next start re-indexes.
+name: insightask-sql
+
+x-api: &api
+  image: ${ASKSQL_REGISTRY:-verticalserve}/insightask-sql-api:${ASKSQL_VERSION:-latest}
+  env_file: .env
+  environment:
+    ASKSQL_CATALOG_DB: /data/catalog.db   # the snapshot lives on the volume, never in the image
+  volumes:
+    - catalog:/data
+    # Uncomment to override the bundled semantics with a site-specific space:
+    # - ./spaces:/app/examples:ro
+
+services:
+  # Runs once, then exits. `api` waits for it to succeed, so the service is
+  # never reachable in a half-indexed state.
+  init:
+    <<: *api
+    command: ["asksql", "bootstrap"]
+    restart: "no"
+
+  api:
+    <<: *api
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    ports:
+      # Loopback only — the UI reaches the API over the compose network, so this
+      # is for host-side debugging. Publish it wider only if something external
+      # must call the API directly.
+      - "127.0.0.1:${ASKSQL_API_PORT:-8088}:8088"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8088/health', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  ui:
+    image: ${ASKSQL_REGISTRY:-verticalserve}/insightask-sql-ui:${ASKSQL_VERSION:-latest}
+    ports:
+      - "${ASKSQL_UI_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+volumes:
+  catalog:
